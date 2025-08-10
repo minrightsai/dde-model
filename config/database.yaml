@@ -1,0 +1,56 @@
+# Database Configuration
+database:
+  host: minrights-pg.chq86qgigowu.us-east-1.rds.amazonaws.com
+  port: 5432
+  database: dde
+  user: minrights
+  password: 2Knowthyself33!
+  
+# Column mappings from generic to actual
+column_mapping:
+  # Well header columns (ed_wells table)
+  WELL_ID: well_id
+  LAT: lat
+  LON: lon
+  FIRST_PROD_DATE: first_prod_date
+  FORMATION: formation
+  OPERATOR: operator
+  LATERAL_LENGTH: lateral_length
+  PROPPANT_USED: proppant_lbs
+  WATER_USED: fluid_gals
+  SPUD_DATE: spud_date
+  COMPLETION_DATE: completion_date
+  STATE: state
+  BASIN: basin
+  ORIENTATION: drill_type
+  
+  # Production columns (ed_prod table)
+  OIL_MO_PROD: oil_bbls
+  GAS_MO_PROD: gas_mcf
+  WATER_MO_PROD: water_bbls
+  PROD_DATE: prod_date
+  PROD_MONTH: prod_month
+  CUM_OIL: cum_oil_bbls
+  CUM_GAS: cum_gas_mcf
+
+# Filters for DJ Basin focus
+filters:
+  state_code: 'CO'
+  orientation: 'Horizontal'
+  min_spud_date: '2010-01-01'
+  basin_pattern: 'Denver Basin'
+  
+# Table names
+tables:
+  wells: data.model_wells  # Changed from ed_wells
+  production: data.model_prod  # Changed from ed_prod
+  early_rates: data.early_rates
+  candidates: data.analog_candidates
+  embeddings: data.curve_embeddings
+
+# Candidate pool parameters
+candidate_filters:
+  max_distance_miles: 15.0
+  lateral_length_tolerance: 0.2  # ±20%
+  max_zero_months: 2
+  enforce_temporal_constraint: true  # No future data leakage

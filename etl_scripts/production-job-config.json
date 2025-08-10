@@ -1,0 +1,24 @@
+{
+  "Name": "energy-production-etl",
+  "Role": "arn:aws:iam::277707132474:role/GlueETLRole", 
+  "Command": {
+    "Name": "glueetl",
+    "ScriptLocation": "s3://aws-glue-assets-277707132474-us-east-1/scripts/production_etl_glue.py",
+    "PythonVersion": "3"
+  },
+  "DefaultArguments": {
+    "--S3_OIL_PATH": "s3://energy-domain-data/energy-domain/energy_domain_datashare/latest/well_prod_liq_master/",
+    "--S3_GAS_PATH": "s3://energy-domain-data/energy-domain/energy_domain_datashare/latest/well_prod_gas_master/",
+    "--POSTGRES_HOST": "minrights-pg.chq86qgigowu.us-east-1.rds.amazonaws.com",
+    "--POSTGRES_PORT": "5432",
+    "--POSTGRES_DATABASE": "dde",
+    "--POSTGRES_USERNAME": "minrights",
+    "--POSTGRES_PASSWORD": "2Knowthyself33!",
+    "--POSTGRES_TABLE": "data.ed_prod",
+    "--BATCH_SIZE": "50000",
+    "--conf": "spark.sql.legacy.parquet.int96RebaseModeInRead=LEGACY --conf spark.sql.legacy.parquet.int96RebaseModeInWrite=LEGACY --conf spark.sql.legacy.parquet.datetimeRebaseModeInRead=LEGACY --conf spark.sql.parquet.datetimeRebaseModeInRead=LEGACY --conf spark.sql.parquet.int96RebaseModeInRead=LEGACY"
+  },
+  "MaxCapacity": 10,
+  "Timeout": 2880,
+  "GlueVersion": "4.0"
+}
