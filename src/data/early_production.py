@@ -1,6 +1,6 @@
 """
 Step 1: Build Early Production Table
-Creates a table with first 9 months of production for each well
+Creates a table with configurable months of production for each well (configurable per basin)
 """
 
 import numpy as np
@@ -14,25 +14,40 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from src.data.db_connector import DatabaseConnector
+from src.config import BasinConfig
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 class EarlyProductionBuilder:
-    """Builds early production table with 9-month production arrays"""
+    """Builds early production table with configurable-month production arrays"""
     
-    def __init__(self, db_connector=None):
-        """Initialize with database connector"""
+    def __init__(self, db_connector=None, basin='dj_basin'):
+        """Initialize with database connector and basin configuration
+        
+        Args:
+            db_connector: DatabaseConnector instance (optional)
+            basin: Basin name for configuration (default: 'dj_basin')
+        """
         self.db = db_connector or DatabaseConnector()
-        self.wells_table = self.db.tables['wells']
-        self.prod_table = self.db.tables['production']
-        self.early_rates_table = self.db.tables['early_rates']
+        self.basin_config = BasinConfig(basin)
+        self.basin_name = basin
+        
+        # Use config for table names
+        self.wells_table = self.basin_config.get_table_name('wells')
+        self.prod_table = self.basin_config.get_table_name('production')
+        self.early_rates_table = self.basin_config.get_table_name('early_rates')
+        
+        # Get configurable parameters
+        self.peak_month_window = self.basin_config.get('peak_month_window')
+        self.months_to_analyze = self.basin_config.get('months_to_analyze')
     
     def create_early_rates_table(self):
         """Create the early_rates table if it doesn't exist"""
         query = f"""
         CREATE TABLE IF NOT EXISTS {self.early_rates_table} (
             well_id TEXT PRIMARY KEY,
+            basin_name TEXT,
             operator_name TEXT,
             formation TEXT,
             latitude NUMERIC,
@@ -59,6 +74,8 @@ class EarlyProductionBuilder:
         );
         
         -- Create indexes
+        CREATE INDEX IF NOT EXISTS idx_early_rates_basin_name 
+            ON {self.early_rates_table}(basin_name);
         CREATE INDEX IF NOT EXISTS idx_early_rates_first_prod_date 
             ON {self.early_rates_table}(first_prod_date);
         CREATE INDEX IF NOT EXISTS idx_early_rates_formation 
@@ -82,23 +99,35 @@ class EarlyProductionBuilder:
             limit: Optional limit on total wells to process (for testing)
         """
         
-        # Get eligible wells
+        # Get eligible wells based on actual production data
+        # First get wells that have production data, then join with well metadata
         wells_query = f"""
+        WITH wells_with_production AS (
+            SELECT 
+                p.{self.db.column_mapping['WELL_ID']} as well_id,
+                MIN(p.{self.db.column_mapping['PROD_DATE']}) as actual_first_prod_date,
+                COUNT(DISTINCT p.prod_month) as months_available
+            FROM {self.prod_table} p
+            GROUP BY p.{self.db.column_mapping['WELL_ID']}
+            HAVING COUNT(DISTINCT p.prod_month) >= {self.months_to_analyze}  -- Only wells with required months
+        )
         SELECT 
             w.{self.db.column_mapping['WELL_ID']} as well_id,
             w.{self.db.column_mapping['OPERATOR']} as operator_name,
             w.{self.db.column_mapping['FORMATION']} as formation,
             w.{self.db.column_mapping['LAT']} as latitude,
             w.{self.db.column_mapping['LON']} as longitude,
-            w.{self.db.column_mapping['FIRST_PROD_DATE']} as first_prod_date,
+            wp.actual_first_prod_date as first_prod_date,
             w.{self.db.column_mapping['LATERAL_LENGTH']} as lateral_length,
             w.{self.db.column_mapping['PROPPANT_USED']} as proppant_used,
-            w.{self.db.column_mapping['WATER_USED']} as water_used
+            w.{self.db.column_mapping['WATER_USED']} as water_used,
+            wp.months_available
         FROM {self.wells_table} w
-        WHERE {self.db.get_dj_basin_filter()}
-        AND w.{self.db.column_mapping['FIRST_PROD_DATE']} IS NOT NULL
+        INNER JOIN wells_with_production wp ON w.{self.db.column_mapping['WELL_ID']} = wp.well_id
+        WHERE w.basin_name = '{self.basin_name}'
         AND w.{self.db.column_mapping['LATERAL_LENGTH']} > 0
-        ORDER BY w.{self.db.column_mapping['FIRST_PROD_DATE']} DESC, w.{self.db.column_mapping['WELL_ID']}
+        AND w.first_prod_date >= '{self.basin_config.get('min_vintage_year')}-01-01'
+        ORDER BY wp.actual_first_prod_date DESC, w.{self.db.column_mapping['WELL_ID']}
         """
         
         if limit:
@@ -123,16 +152,18 @@ class EarlyProductionBuilder:
         
         well_ids = wells_batch['well_id'].tolist()
         
-        # Get production data for these wells
+        # Get production data for these wells - using prod_month which is already peak-aligned
         prod_query = f"""
         SELECT 
             p.{self.db.column_mapping['WELL_ID']} as well_id,
             p.{self.db.column_mapping['PROD_DATE']} as prod_date,
+            p.prod_month,
             p.{self.db.column_mapping['OIL_MO_PROD']} as oil,
             p.{self.db.column_mapping['GAS_MO_PROD']} as gas
         FROM {self.prod_table} p
         WHERE p.{self.db.column_mapping['WELL_ID']} = ANY(%s)
-        ORDER BY p.{self.db.column_mapping['WELL_ID']}, p.{self.db.column_mapping['PROD_DATE']}
+        AND p.prod_month >= 0 AND p.prod_month <= {self.months_to_analyze - 1}  -- Get months 0 to (months_to_analyze-1)
+        ORDER BY p.{self.db.column_mapping['WELL_ID']}, p.prod_month
         """
         
         production = pd.DataFrame(self.db.execute_query(prod_query, (well_ids,)))
@@ -144,31 +175,25 @@ class EarlyProductionBuilder:
         # Process each well
         records = []
         for _, well in wells_batch.iterrows():
-            well_prod = production[production['well_id'] == well['well_id']]
+            well_prod = production[production['well_id'] == well['well_id']].sort_values('prod_month')
             
             if well_prod.empty:
                 continue
             
-            # Align production to first 9 months
-            first_prod_date = pd.to_datetime(well['first_prod_date'])
-            well_prod['prod_date'] = pd.to_datetime(well_prod['prod_date'])
+            # Since data is peak-aligned, prod_month 0 to (months_to_analyze-1) represents our months
+            # Create array with zeros for any missing months
+            oil_m1_9 = np.zeros(self.months_to_analyze)
+            gas_m1_9 = np.zeros(self.months_to_analyze)
             
-            # Get first 9 months
-            end_date = first_prod_date + pd.DateOffset(months=9)
-            early_prod = well_prod[
-                (well_prod['prod_date'] >= first_prod_date) & 
-                (well_prod['prod_date'] < end_date)
-            ].sort_values('prod_date')
+            for _, row in well_prod.iterrows():
+                month_idx = int(row['prod_month'])
+                if 0 <= month_idx < self.months_to_analyze:
+                    oil_m1_9[month_idx] = row['oil'] if pd.notna(row['oil']) else 0
+                    gas_m1_9[month_idx] = row['gas'] if pd.notna(row['gas']) else 0
             
-            if len(early_prod) < 9:
-                continue  # Skip wells without full 9 months
-            
-            # Take first 9 months
-            early_prod = early_prod.head(9)
-            
-            # Extract production arrays
-            oil_m1_9 = early_prod['oil'].fillna(0).values[:9]
-            gas_m1_9 = early_prod['gas'].fillna(0).values[:9]
+            # Verify we have at least required months of data (already filtered in query but double-check)
+            if len(well_prod) < self.months_to_analyze:
+                continue  # Skip if incomplete data
             
             # Count zero months
             zero_months = np.sum(oil_m1_9 == 0)
@@ -198,6 +223,7 @@ class EarlyProductionBuilder:
             
             record = {
                 'well_id': well['well_id'],
+                'basin_name': self.basin_name,
                 'operator_name': well['operator_name'],
                 'formation': well['formation'],
                 'latitude': well['latitude'],
@@ -232,14 +258,14 @@ class EarlyProductionBuilder:
         
         insert_query = f"""
         INSERT INTO {self.early_rates_table} (
-            well_id, operator_name, formation, latitude, longitude,
+            well_id, basin_name, operator_name, formation, latitude, longitude,
             first_prod_date, lateral_length, proppant_used, water_used,
             proppant_per_ft, fluid_per_ft, oil_m1_9, gas_m1_9,
             oil_m1_9_norm, gas_m1_9_norm, oil_m1_9_log, gas_m1_9_log,
             zero_months_count, avg_oil_m1_9, avg_gas_m1_9,
             cum_oil_m1_9, cum_gas_m1_9, geom
         ) VALUES (
-            %(well_id)s, %(operator_name)s, %(formation)s, %(latitude)s, %(longitude)s,
+            %(well_id)s, %(basin_name)s, %(operator_name)s, %(formation)s, %(latitude)s, %(longitude)s,
             %(first_prod_date)s, %(lateral_length)s, %(proppant_used)s, %(water_used)s,
             %(proppant_per_ft)s, %(fluid_per_ft)s, %(oil_m1_9)s, %(gas_m1_9)s,
             %(oil_m1_9_norm)s, %(gas_m1_9_norm)s, %(oil_m1_9_log)s, %(gas_m1_9_log)s,
@@ -248,6 +274,7 @@ class EarlyProductionBuilder:
             ST_SetSRID(ST_MakePoint(%(longitude)s, %(latitude)s), 4326)
         )
         ON CONFLICT (well_id) DO UPDATE SET
+            basin_name = EXCLUDED.basin_name,
             oil_m1_9 = EXCLUDED.oil_m1_9,
             gas_m1_9 = EXCLUDED.gas_m1_9,
             oil_m1_9_norm = EXCLUDED.oil_m1_9_norm,
@@ -302,6 +329,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Build early production table')
+    parser.add_argument('--basin', type=str, default='dj_basin',
+                        help='Basin configuration to use (default: dj_basin)')
     parser.add_argument('--limit', type=int, default=None,
                         help='Limit number of wells to process (for testing)')
     parser.add_argument('--batch-size', type=int, default=50,
@@ -311,7 +340,8 @@ def main():
     if args.limit:
         logger.info(f"TEST MODE: Processing only {args.limit} wells")
     
-    builder = EarlyProductionBuilder()
+    logger.info(f"Using basin configuration: {args.basin}")
+    builder = EarlyProductionBuilder(basin=args.basin)
     
     # Check if tables exist
     if not builder.db.check_tables_exist():

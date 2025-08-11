@@ -14,8 +14,9 @@
     "--POSTGRES_DATABASE": "dde",
     "--POSTGRES_USERNAME": "minrights",
     "--POSTGRES_PASSWORD": "2Knowthyself33!",
-    "--POSTGRES_TABLE": "data.ed_prod",
+    "--POSTGRES_TABLE": "data.model_prod",
     "--BATCH_SIZE": "50000",
+    "--TARGET_BASINS": "Denver Basin",
     "--conf": "spark.sql.legacy.parquet.int96RebaseModeInRead=LEGACY --conf spark.sql.legacy.parquet.int96RebaseModeInWrite=LEGACY --conf spark.sql.legacy.parquet.datetimeRebaseModeInRead=LEGACY --conf spark.sql.parquet.datetimeRebaseModeInRead=LEGACY --conf spark.sql.parquet.int96RebaseModeInRead=LEGACY"
   },
   "MaxCapacity": 10,

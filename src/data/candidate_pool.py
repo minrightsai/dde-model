@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
 from src.data.db_connector import DatabaseConnector
+from src.config import BasinConfig
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -23,26 +24,35 @@ class CandidatePoolBuilder:
     
     def __init__(self, 
                  db_connector: Optional[DatabaseConnector] = None,
-                 distance_miles: float = 15.0,
-                 lateral_length_tolerance: float = 0.2,
+                 basin: str = 'dj_basin',
+                 distance_miles: Optional[float] = None,
+                 lateral_length_tolerance: Optional[float] = None,
                  max_zero_months: int = 2):
         """
         Initialize candidate pool builder
         
         Args:
             db_connector: Database connection manager
-            distance_miles: Maximum distance for candidates (miles)
-            lateral_length_tolerance: Tolerance for lateral length matching (±20% default)
+            basin: Basin name for configuration (default: 'dj_basin')
+            distance_miles: Maximum distance for candidates (miles) - overrides config if provided
+            lateral_length_tolerance: Tolerance for lateral length matching - overrides config if provided
             max_zero_months: Maximum allowed zero production months
         """
         self.db = db_connector or DatabaseConnector()
+        self.config = BasinConfig(basin)
         self.early_rates_table = self.db.tables['early_rates']
         self.candidates_table = self.db.tables['candidates']
         
-        # Filter parameters
-        self.distance_miles = distance_miles
-        self.lateral_length_tolerance = lateral_length_tolerance
+        # Filter parameters - use config values unless overridden
+        self.distance_miles = distance_miles or self.config.get('max_distance_miles')
+        self.lateral_length_tolerance = lateral_length_tolerance or self.config.get('lateral_tolerance')
         self.max_zero_months = max_zero_months
+        self.min_vintage_year = self.config.get('min_vintage_year')
+        
+        logger.info(f"Initialized CandidatePoolBuilder for {self.config.config['name']}")
+        logger.info(f"  Max distance: {self.distance_miles} miles")
+        logger.info(f"  Lateral tolerance: {self.lateral_length_tolerance}")
+        logger.info(f"  Min vintage year: {self.min_vintage_year}")
     
     def create_candidates_table(self):
         """Create the analog_candidates table if it doesn't exist"""
@@ -51,6 +61,7 @@ class CandidatePoolBuilder:
             id SERIAL PRIMARY KEY,
             target_well_id TEXT NOT NULL,
             candidate_well_id TEXT NOT NULL,
+            basin_name TEXT NOT NULL DEFAULT 'dj_basin',
             distance_mi NUMERIC,
             length_ratio NUMERIC,
             delta_length NUMERIC,
@@ -71,6 +82,10 @@ class CandidatePoolBuilder:
             CONSTRAINT unique_target_candidate UNIQUE(target_well_id, candidate_well_id)
         );
         
+        -- Add basin_name column if it doesn't exist (for existing tables)
+        ALTER TABLE {self.candidates_table} 
+        ADD COLUMN IF NOT EXISTS basin_name TEXT NOT NULL DEFAULT 'dj_basin';
+        
         -- Create indexes for efficient querying
         CREATE INDEX IF NOT EXISTS idx_candidates_target 
             ON {self.candidates_table}(target_well_id);
@@ -82,6 +97,8 @@ class CandidatePoolBuilder:
             ON {self.candidates_table}(formation_match);
         CREATE INDEX IF NOT EXISTS idx_candidates_same_operator 
             ON {self.candidates_table}(same_operator);
+        CREATE INDEX IF NOT EXISTS idx_candidates_basin 
+            ON {self.candidates_table}(basin_name);
         """
         
         self.db.execute_query(query, fetch=False)
@@ -96,7 +113,10 @@ class CandidatePoolBuilder:
             limit: Optional limit on number of target wells to process
         """
         
-        # Get all eligible target wells
+        # Get basin-specific API filter
+        api_filter = self.config.get_api_filter()
+        
+        # Get all eligible target wells filtered by basin and vintage
         target_query = f"""
         SELECT 
             well_id,
@@ -112,6 +132,8 @@ class CandidatePoolBuilder:
             geom
         FROM {self.early_rates_table}
         WHERE zero_months_count <= {self.max_zero_months}
+            AND {api_filter}
+            AND EXTRACT(YEAR FROM first_prod_date) >= {self.min_vintage_year}
         ORDER BY first_prod_date DESC, well_id
         """
         
@@ -147,6 +169,9 @@ class CandidatePoolBuilder:
         
         Returns filtered candidates with computed features
         """
+        
+        # Get basin-specific API filter for candidates
+        api_filter = self.config.get_api_filter()
         
         # Query for candidates with all filters applied
         candidate_query = f"""
@@ -199,8 +224,14 @@ class CandidatePoolBuilder:
             -- Not the same well
             c.well_id != t.well_id
             
+            -- Basin filter for candidates
+            AND {api_filter.replace('well_id', 'c.well_id')}
+            
             -- No future data leakage
             AND c.first_prod_date <= t.first_prod_date
+            
+            -- Vintage filter for candidates
+            AND EXTRACT(YEAR FROM c.first_prod_date) >= %(min_vintage_year)s
             
             -- Distance constraint (using spatial index)
             AND ST_DWithin(
@@ -220,10 +251,15 @@ class CandidatePoolBuilder:
         ORDER BY distance_mi, ABS(1 - (c.lateral_length / NULLIF(t.lateral_length, 0)))
         """
         
+        # Skip wells with missing coordinates
+        if pd.isna(target['latitude']) or pd.isna(target['longitude']):
+            logger.warning(f"Skipping well {target['well_id']} - missing coordinates")
+            return pd.DataFrame()
+        
         params = {
             'target_well_id': target['well_id'],
-            'target_lat': float(target['latitude']) if pd.notna(target['latitude']) else 0,
-            'target_lon': float(target['longitude']) if pd.notna(target['longitude']) else 0,
+            'target_lat': float(target['latitude']),
+            'target_lon': float(target['longitude']),
             'target_first_prod': target['first_prod_date'],
             'target_lateral': float(target['lateral_length']) if pd.notna(target['lateral_length']) else 0,
             'target_ppf': float(target['proppant_per_ft']) if pd.notna(target['proppant_per_ft']) else 0,
@@ -233,7 +269,8 @@ class CandidatePoolBuilder:
             'max_distance_m': self.distance_miles * 1609.34,  # Convert miles to meters
             'min_length_ratio': 1 - self.lateral_length_tolerance,
             'max_length_ratio': 1 + self.lateral_length_tolerance,
-            'max_zero_months': self.max_zero_months
+            'max_zero_months': self.max_zero_months,
+            'min_vintage_year': self.min_vintage_year
         }
         
         candidates = pd.DataFrame(self.db.execute_query(candidate_query, params))
@@ -248,6 +285,7 @@ class CandidatePoolBuilder:
             record = {
                 'target_well_id': target['well_id'],
                 'candidate_well_id': candidate['candidate_well_id'],
+                'basin_name': self.config.basin_name,
                 'distance_mi': float(candidate['distance_mi']) if pd.notna(candidate['distance_mi']) else None,
                 'length_ratio': float(candidate['length_ratio']) if pd.notna(candidate['length_ratio']) else None,
                 'delta_length': float(candidate['delta_length']) if pd.notna(candidate['delta_length']) else None,
@@ -268,14 +306,14 @@ class CandidatePoolBuilder:
         if records:
             insert_query = f"""
             INSERT INTO {self.candidates_table} (
-                target_well_id, candidate_well_id, distance_mi,
+                target_well_id, candidate_well_id, basin_name, distance_mi,
                 length_ratio, delta_length, formation_match,
                 same_operator, vintage_gap_years, ppf_ratio, fpf_ratio,
                 target_first_prod, candidate_first_prod,
                 target_operator, candidate_operator,
                 target_formation, candidate_formation
             ) VALUES (
-                %(target_well_id)s, %(candidate_well_id)s, %(distance_mi)s,
+                %(target_well_id)s, %(candidate_well_id)s, %(basin_name)s, %(distance_mi)s,
                 %(length_ratio)s, %(delta_length)s, %(formation_match)s,
                 %(same_operator)s, %(vintage_gap_years)s, %(ppf_ratio)s, %(fpf_ratio)s,
                 %(target_first_prod)s, %(candidate_first_prod)s,
@@ -283,6 +321,7 @@ class CandidatePoolBuilder:
                 %(target_formation)s, %(candidate_formation)s
             )
             ON CONFLICT (target_well_id, candidate_well_id) DO UPDATE SET
+                basin_name = EXCLUDED.basin_name,
                 distance_mi = EXCLUDED.distance_mi,
                 length_ratio = EXCLUDED.length_ratio,
                 created_at = CURRENT_TIMESTAMP
@@ -296,7 +335,7 @@ class CandidatePoolBuilder:
                     conn.commit()
     
     def get_statistics(self) -> Dict:
-        """Get statistics on the candidate pools"""
+        """Get statistics on the candidate pools for this basin"""
         
         stats_query = f"""
         SELECT 
@@ -311,9 +350,10 @@ class CandidatePoolBuilder:
             MIN(distance_mi) as min_distance_mi,
             MAX(distance_mi) as max_distance_mi
         FROM {self.candidates_table}
+        WHERE basin_name = %s
         """
         
-        stats = self.db.execute_query(stats_query)[0]
+        stats = self.db.execute_query(stats_query, (self.config.basin_name,))[0]
         
         # Get distribution of candidates per target
         distribution_query = f"""
@@ -325,13 +365,14 @@ class CandidatePoolBuilder:
         FROM (
             SELECT target_well_id, COUNT(*) as candidate_count
             FROM {self.candidates_table}
+            WHERE basin_name = %s
             GROUP BY target_well_id
         ) t
         """
         
-        dist_stats = self.db.execute_query(distribution_query)[0]
+        dist_stats = self.db.execute_query(distribution_query, (self.config.basin_name,))[0]
         
-        logger.info("Candidate Pool Statistics:")
+        logger.info(f"Candidate Pool Statistics for {self.config.config['name']}:")
         logger.info(f"  Unique target wells: {stats['unique_targets']:,}")
         logger.info(f"  Unique candidate wells: {stats['unique_candidates']:,}")
         logger.info(f"  Total target-candidate pairs: {stats['total_pairs']:,}")
@@ -347,7 +388,7 @@ class CandidatePoolBuilder:
     
     def get_candidates_for_well(self, well_id: str, max_candidates: int = 100) -> pd.DataFrame:
         """
-        Get candidate analogs for a specific well
+        Get candidate analogs for a specific well from this basin
         
         Args:
             well_id: Target well ID
@@ -367,12 +408,13 @@ class CandidatePoolBuilder:
         FROM {self.candidates_table} c
         JOIN {self.early_rates_table} er ON c.candidate_well_id = er.well_id
         WHERE c.target_well_id = %s
+            AND c.basin_name = %s
         ORDER BY c.distance_mi, ABS(1 - c.length_ratio)
         LIMIT %s
         """
         
         candidates = pd.DataFrame(
-            self.db.execute_query(query, (well_id, max_candidates))
+            self.db.execute_query(query, (well_id, self.config.basin_name, max_candidates))
         )
         
         return candidates
@@ -382,6 +424,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description='Build analog candidate pools')
+    parser.add_argument('--basin', type=str, default='dj_basin',
+                        help='Basin name for configuration (default: dj_basin)')
     parser.add_argument('--limit', type=int, default=None,
                         help='Limit number of target wells to process (None for all)')
     parser.add_argument('--batch-size', type=int, default=10,
@@ -389,8 +433,7 @@ def main():
     args = parser.parse_args()
     
     builder = CandidatePoolBuilder(
-        distance_miles=15.0,
-        lateral_length_tolerance=0.2,
+        basin=args.basin,
         max_zero_months=2
     )
     
@@ -398,7 +441,7 @@ def main():
     builder.create_candidates_table()
     
     # Build candidate pools
-    logger.info(f"Building candidate pools (limit={args.limit})...")
+    logger.info(f"Building candidate pools for {builder.config.config['name']} (limit={args.limit})...")
     builder.build_candidate_pools(batch_size=args.batch_size, limit=args.limit)
     
     # Get statistics

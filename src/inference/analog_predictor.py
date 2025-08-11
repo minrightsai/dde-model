@@ -14,8 +14,15 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.data.db_connector import DatabaseConnector
-from src.models.lightgbm_ranker import LightGBMAnalogRanker
 from src.models.baseline import BaselinePicker
+
+# Optional import for LightGBM (may not be implemented yet)
+try:
+    from src.models.lightgbm_ranker import LightGBMAnalogRanker
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LightGBMAnalogRanker = None
+    LIGHTGBM_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -37,6 +44,8 @@ class AnalogPredictor:
         
         # Load appropriate model
         if model_type == 'lightgbm':
+            if not LIGHTGBM_AVAILABLE:
+                raise ImportError("LightGBM ranker not available. Use model_type='baseline' instead.")
             self.model = LightGBMAnalogRanker()
             if model_path:
                 self.model.load(model_path)
@@ -76,32 +85,42 @@ class AnalogPredictor:
         """
         logger.info(f"Predicting for new well at ({lat:.4f}, {lon:.4f})")
         
-        # Step 1: Find analog candidates
-        candidates = self._find_candidates(
-            lat, lon, formation, lateral_length, 
-            proppant_per_ft, fluid_per_ft, planned_date
-        )
-        
-        if len(candidates) == 0:
-            return {
-                'error': 'No suitable analog candidates found',
-                'lat': lat,
-                'lon': lon,
-                'formation': formation
-            }
-        
-        logger.info(f"Found {len(candidates)} analog candidates")
-        
         # Step 2: Score and rank candidates
         if self.model_type == 'lightgbm':
+            # Step 1: Find analog candidates for LightGBM
+            candidates = self._find_candidates(
+                lat, lon, formation, lateral_length, 
+                proppant_per_ft, fluid_per_ft, planned_date
+            )
+            
+            if len(candidates) == 0:
+                return {
+                    'error': 'No suitable analog candidates found',
+                    'lat': lat,
+                    'lon': lon,
+                    'formation': formation
+                }
+            
+            logger.info(f"Found {len(candidates)} analog candidates")
+            
             result = self._predict_lightgbm(
                 candidates, lateral_length, proppant_per_ft, 
                 fluid_per_ft, operator
             )
         else:
-            result = self._predict_baseline(
-                candidates, lateral_length, proppant_per_ft
+            # Use BaselinePicker's integrated pipeline (does its own candidate finding)
+            result = self.model.predict(
+                target_lat=lat,
+                target_lon=lon,
+                target_formation=formation,
+                target_lateral_length=lateral_length,
+                target_proppant_per_ft=proppant_per_ft,
+                cutoff_date=planned_date
             )
+            
+            # Transform to expected format if successful
+            if 'error' not in result:
+                result = self._format_baseline_result(result)
         
         # Add input parameters
         result['input'] = {
@@ -166,6 +185,24 @@ class AnalogPredictor:
             )
         
         return candidates
+    
+    def _format_baseline_result(self, baseline_result: Dict) -> Dict:
+        """Format BaselinePicker result to match AnalogPredictor expected format"""
+        
+        return {
+            'model': 'baseline',
+            'forecast': {
+                'p50_oil_monthly': baseline_result['p50_oil_monthly'],
+                'p10_oil_monthly': baseline_result['p10_oil_monthly'],
+                'p90_oil_monthly': baseline_result['p90_oil_monthly'],
+                'p50_cum_9mo': baseline_result['p50_cum_9mo'],
+                'p10_cum_9mo': baseline_result['p10_cum_9mo'],
+                'p90_cum_9mo': baseline_result['p90_cum_9mo']
+            },
+            'n_analogs': baseline_result['n_analogs'],
+            'analogs': baseline_result['analogs'],
+            'metadata': baseline_result['metadata']
+        }
     
     def _predict_lightgbm(self, candidates: pd.DataFrame, 
                          lateral_length: float, proppant_per_ft: float,
@@ -291,63 +328,6 @@ class AnalogPredictor:
                 'avg_distance_mi': round(selected_df['distance_mi'].mean(), 1),
                 'formation_match_pct': round(selected_df['formation_match'].mean() * 100, 1),
                 'avg_vintage_gap': round(selected_df['vintage_years'].mean(), 1)
-            }
-        }
-    
-    def _predict_baseline(self, candidates: pd.DataFrame,
-                         lateral_length: float, proppant_per_ft: float) -> Dict:
-        """Make prediction using baseline model"""
-        
-        # Simple distance-based selection
-        selected = candidates.nsmallest(20, 'distance_mi')
-        
-        # Warp and average
-        warped_curves = []
-        for _, row in selected.iterrows():
-            oil_curve = np.array([float(v) for v in row['oil_m1_9']])
-            
-            # Apply simple warping
-            length_scaler = min(1.3, max(0.7, lateral_length / row['lateral_length']))
-            ppf_scaler = min(1.3, max(0.7, np.power(
-                proppant_per_ft / (row['proppant_per_ft'] + 1), 0.2
-            )))
-            
-            warped = oil_curve * length_scaler * ppf_scaler
-            warped_curves.append(warped)
-        
-        # Simple average
-        p50_curve = np.mean(warped_curves, axis=0)
-        p10_curve = np.percentile(warped_curves, 10, axis=0)
-        p90_curve = np.percentile(warped_curves, 90, axis=0)
-        
-        # Prepare analog list
-        analogs = []
-        for _, row in selected.head(10).iterrows():
-            analogs.append({
-                'well_id': row['well_id'],
-                'distance_mi': round(row['distance_mi'], 1),
-                'operator': row['operator'],
-                'formation': row['formation'],
-                'lateral_length': row['lateral_length'],
-                'vintage_year': int(row['first_prod_date'].year) if pd.notna(row['first_prod_date']) else None
-            })
-        
-        return {
-            'model': 'baseline',
-            'forecast': {
-                'p50_oil_monthly': p50_curve.tolist(),
-                'p10_oil_monthly': p10_curve.tolist(),
-                'p90_oil_monthly': p90_curve.tolist(),
-                'p50_cum_9mo': float(np.sum(p50_curve)),
-                'p10_cum_9mo': float(np.sum(p10_curve)),
-                'p90_cum_9mo': float(np.sum(p90_curve))
-            },
-            'n_analogs': len(selected),
-            'analogs': analogs,
-            'metadata': {
-                'avg_distance_mi': round(selected['distance_mi'].mean(), 1),
-                'formation_match_pct': round(selected['formation_match'].mean() * 100, 1),
-                'avg_vintage_gap': round(selected['vintage_years'].mean(), 1)
             }
         }
     

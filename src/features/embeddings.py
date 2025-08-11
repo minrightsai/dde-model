@@ -160,12 +160,20 @@ class CurveEmbeddings:
         
         records = []
         for i, (_, row) in enumerate(df.iterrows()):
+            # Check if this well has gas embeddings (not NaN)
+            if not np.isnan(gas_embeddings[i]).any():
+                gas_embedding = gas_embeddings[i].tolist()
+                gas_var_val = float(gas_var)
+            else:
+                gas_embedding = None
+                gas_var_val = None
+            
             records.append((
                 row['well_id'],
                 oil_embeddings[i].tolist(),
-                gas_embeddings[i].tolist(),
+                gas_embedding,
                 float(oil_var),
-                float(gas_var)
+                gas_var_val
             ))
         
         with self.db.get_connection() as conn:
@@ -221,11 +229,19 @@ class CurveEmbeddings:
             self.gas_mean = np.mean(gas_curves, axis=0)
             self.gas_std = np.std(gas_curves, axis=0)
             
-            self.pca_gas, self.scaler_gas, gas_embeddings = self.fit_pca(gas_curves)
+            self.pca_gas, self.scaler_gas, gas_embeddings_fitted = self.fit_pca(gas_curves)
             gas_var = np.sum(self.pca_gas.explained_variance_ratio_)
+            
+            # Create full gas embeddings array matching oil_valid indices
+            gas_embeddings = np.full((len(oil_valid), self.n_components), np.nan)
+            gas_idx = 0
+            for i, idx in enumerate(oil_valid):
+                if idx in gas_valid:
+                    gas_embeddings[i] = gas_embeddings_fitted[gas_idx]
+                    gas_idx += 1
         else:
             logger.warning("No valid gas curves found")
-            gas_embeddings = np.zeros((len(oil_embeddings), self.n_components))
+            gas_embeddings = np.full((len(oil_embeddings), self.n_components), np.nan)
             gas_var = 0.0
         
         valid_df = df.iloc[oil_valid].reset_index(drop=True)
