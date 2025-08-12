@@ -126,7 +126,7 @@ try:
         # Well type and trajectory  
         F.col("well_type"),
         F.col("drill_type"),
-        F.lit(None).cast("string").alias("formation"),  # Not available in source data
+        F.col("reservoir").alias("formation"),  # Map reservoir field to formation
         
         # Completion data
         F.col("lateral_length").cast("integer"),

@@ -16,6 +16,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.data.db_connector import DatabaseConnector
 from src.features.feature_builder import FeatureBuilder
+from src.features.ranking_features import build_ranking_features, get_feature_names
 from src.models.baseline import BaselinePicker
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -29,6 +30,7 @@ class LightGBMAnalogRanker:
     """
     
     def __init__(self,
+                 basin: Optional[str] = None,
                  lgb_params: Optional[Dict] = None,
                  top_k: int = 20,
                  max_per_operator: int = 3,
@@ -38,12 +40,14 @@ class LightGBMAnalogRanker:
         Initialize LightGBM ranker
         
         Args:
+            basin: Basin to train/predict for ('dj_basin' or 'bakken')
             lgb_params: LightGBM parameters (uses defaults if None)
             top_k: Number of top analogs to use
             max_per_operator: Maximum analogs per operator
             kappa_length: Warping exponent for lateral length
             kappa_proppant: Warping exponent for proppant
         """
+        self.basin = basin
         self.db = DatabaseConnector()
         self.feature_builder = FeatureBuilder()
         self.baseline_picker = BaselinePicker()  # For candidate generation
@@ -91,16 +95,17 @@ class LightGBMAnalogRanker:
         logger.info("Loading training data...")
         
         # Load candidate pairs with features
+        basin_filter = f"AND er.basin_name = '{self.basin}'" if self.basin else ""
+        basin_filter_ac = f"AND ac.basin_name = '{self.basin}'" if self.basin else ""
+        
         query = """
         WITH training_targets AS (
-            SELECT DISTINCT target_well_id
-            FROM data.analog_candidates
-            WHERE target_well_id IN (
-                SELECT well_id 
-                FROM data.early_rates 
-                WHERE EXTRACT(YEAR FROM first_prod_date) BETWEEN 2016 AND 2023
-            )
-            ORDER BY target_well_id
+            SELECT DISTINCT ac.target_well_id
+            FROM data.analog_candidates ac
+            JOIN data.early_rates er ON ac.target_well_id = er.well_id
+            WHERE EXTRACT(YEAR FROM er.first_prod_date) BETWEEN 2016 AND 2023
+            {basin_filter}
+            ORDER BY ac.target_well_id
             {limit_clause}
         ),
         candidate_pairs AS (
@@ -131,18 +136,48 @@ class LightGBMAnalogRanker:
             JOIN data.early_rates t ON ac.target_well_id = t.well_id
             JOIN data.early_rates c ON ac.candidate_well_id = c.well_id
             LEFT JOIN data.curve_embeddings ce ON c.well_id = ce.well_id
+            WHERE ac.formation_match = true  -- ONLY same-formation pairs for training
+            {basin_filter_ac}
         )
         SELECT * FROM candidate_pairs
         ORDER BY target_well_id, candidate_well_id
-        """.format(limit_clause=f"LIMIT {limit}" if limit else "")
+        """.format(
+            basin_filter=basin_filter,
+            basin_filter_ac=basin_filter_ac,
+            limit_clause=f"LIMIT {limit}" if limit else ""
+        )
         
         with self.db.get_connection() as conn:
             data = pd.read_sql(query, conn)
         
+        # Convert decimal columns to float (handle PostgreSQL Decimal types)
+        for col in data.columns:
+            if data[col].dtype == 'object':
+                try:
+                    data[col] = pd.to_numeric(data[col], errors='ignore')
+                except:
+                    pass
+        
         logger.info(f"Loaded {len(data)} candidate pairs from {data['target_well_id'].nunique()} target wells")
         
-        # Build features
-        features = self._build_features(data)
+        # Build features using centralized function
+        # Create target well dicts for each row
+        all_features = []
+        for target_id in data['target_well_id'].unique():
+            target_data = data[data['target_well_id'] == target_id].iloc[0]
+            target_well = {
+                'lateral_length': target_data['target_lateral'],
+                'proppant_per_ft': target_data['target_ppf'],
+                'formation': target_data['target_formation'],
+                'operator_name': target_data['target_operator'],
+                'first_prod_date': None  # Not needed since vintage_gap is pre-computed
+            }
+            candidates = data[data['target_well_id'] == target_id].copy()
+            features_batch = build_ranking_features(candidates, target_well)
+            all_features.append(features_batch)
+        
+        features = pd.concat(all_features, ignore_index=True)
+        self.feature_columns = get_feature_names()
         
         # Calculate labels based on revenue-weighted error
         labels = self._calculate_graded_labels(data)
@@ -234,12 +269,12 @@ class LightGBMAnalogRanker:
                 # Get candidate production
                 candidate_oil = np.array([float(v) for v in row['candidate_oil']])
                 
-                # Apply warping
-                length_ratio = row['length_ratio']
+                # Apply warping (handle decimal types)
+                length_ratio = float(row['length_ratio'])
                 length_scaler = np.power(length_ratio, self.kappa_length)
                 length_scaler = min(1.3, max(0.7, length_scaler))
                 
-                ppf_ratio = row['target_ppf'] / (row['candidate_ppf'] + 1)
+                ppf_ratio = float(row['target_ppf']) / (float(row['candidate_ppf']) + 1)
                 ppf_scaler = np.power(ppf_ratio, self.kappa_proppant)
                 ppf_scaler = min(1.3, max(0.7, ppf_scaler))
                 
@@ -511,18 +546,25 @@ class LightGBMAnalogRanker:
         logger.info(f"Model loaded from {path}")
 
 
-def train_model(limit_wells: Optional[int] = None, save_path: str = 'models/lightgbm_ranker.pkl'):
+def train_model(basin: Optional[str] = None, limit_wells: Optional[int] = None, save_path: Optional[str] = None):
     """
     Train and save the LightGBM ranker model
     
     Args:
+        basin: Basin to train for ('dj_basin' or 'bakken')
         limit_wells: Optional limit on training wells
-        save_path: Path to save trained model
+        save_path: Path to save trained model (defaults to models/lightgbm_ranker_{basin}.pkl)
     """
-    logger.info("Starting LightGBM ranker training...")
+    if save_path is None:
+        if basin:
+            save_path = f'models/lightgbm_ranker_{basin}.pkl'
+        else:
+            save_path = 'models/lightgbm_ranker.pkl'
+    
+    logger.info(f"Starting LightGBM ranker training for {basin or 'all basins'}...")
     
     # Initialize model
-    ranker = LightGBMAnalogRanker()
+    ranker = LightGBMAnalogRanker(basin=basin)
     
     # Prepare training data
     features, labels, groups = ranker.prepare_training_data(limit=limit_wells)
@@ -558,13 +600,59 @@ def train_model(limit_wells: Optional[int] = None, save_path: str = 'models/ligh
     return ranker
 
 
+def train_basins_parallel(basins: List[str] = ['dj_basin', 'bakken'], limit_wells: Optional[int] = None):
+    """
+    Train models for multiple basins in parallel
+    
+    Args:
+        basins: List of basins to train
+        limit_wells: Optional limit on training wells per basin
+    
+    Returns:
+        Dict of results {basin: (success, path_or_error)}
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    
+    logger.info(f"Training {len(basins)} basins in parallel...")
+    
+    results = {}
+    with ProcessPoolExecutor(max_workers=len(basins)) as executor:
+        futures = {
+            executor.submit(train_model, basin, limit_wells): basin 
+            for basin in basins
+        }
+        
+        for future in as_completed(futures):
+            basin = futures[future]
+            try:
+                ranker = future.result()
+                results[basin] = (True, f'models/lightgbm_ranker_{basin}.pkl')
+                logger.info(f"✓ {basin} training completed")
+            except Exception as e:
+                results[basin] = (False, str(e))
+                logger.error(f"✗ {basin} training failed: {str(e)}")
+    
+    return results
+
+
 if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description="Train LightGBM analog ranker")
+    parser.add_argument('--basin', choices=['dj_basin', 'bakken'], help="Basin to train")
+    parser.add_argument('--basins', nargs='+', default=None, help="Multiple basins to train in parallel")
     parser.add_argument('--limit', type=int, help="Limit number of training wells")
-    parser.add_argument('--output', default='models/lightgbm_ranker.pkl', help="Output path for model")
+    parser.add_argument('--output', help="Output path for model")
+    parser.add_argument('--parallel', action='store_true', help="Train basins in parallel")
     
     args = parser.parse_args()
     
-    train_model(limit_wells=args.limit, save_path=args.output)
+    if args.basins and args.parallel:
+        # Train multiple basins in parallel
+        train_basins_parallel(args.basins, args.limit)
+    elif args.basin:
+        # Train single basin
+        train_model(basin=args.basin, limit_wells=args.limit, save_path=args.output)
+    else:
+        # Train all data (no basin filter)
+        train_model(limit_wells=args.limit, save_path=args.output)

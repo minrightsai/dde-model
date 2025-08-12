@@ -310,3 +310,107 @@ dde-model/
 - First production dates updated: 20,610 wells via py4j UPDATE statements
 - Geographic filtering: CO (39.51-42.19°N, -105.13 to -101.99°W), ND/MT (46.66-48.99°N, -105.26 to -102.00°W)
 - Date filtering: spud_date >= 2014-01-01, production_date >= 2014-01-01
+
+---
+
+## [2025-08-12] - Critical Formation Data Fix & Pipeline Optimization
+### Fixed
+- **Missing Formation Data**: S3 parquet files have `reservoir` field, not `formation`
+  - Updated `wells_etl_glue.py` to map `reservoir` → `formation` 
+  - Result: 75% DJ Basin wells and 94% Bakken wells now have formation data
+  - Previously all wells had NULL formation, breaking analog matching
+
+- **Candidate Pool Performance**: Reduced from hours to minutes
+  - Replaced individual well queries (5,534 separate queries) with single spatial join
+  - DJ Basin: 1.3M candidate pairs generated in 67 seconds (was ~2+ hours)
+  - Bakken: 3.3M candidate pairs generated in 157 seconds
+  - Created `candidate_pool_fast.py` using efficient PostGIS spatial operations
+
+### Updated Pipeline Metrics
+| Metric | Value |
+|--------|-------|
+| **Basins Supported** | **2 (DJ, Bakken)** |
+| Total wells in system | 23,967 |
+| Wells with formation | 20,526 (86%) |
+| Wells with 9-month arrays | 16,342 |
+| Production records | 1.5M |
+| DJ Basin candidates | 1.3M pairs (5,514 targets) |
+| Bakken candidates | 3.3M pairs (6,084 targets) |
+| Average candidates/well | DJ: 242, Bakken: 540 |
+
+### Pipeline Execution Times
+- Wells ETL: 3 minutes
+- Production ETL: 18 minutes  
+- Early Production: <1 minute per basin
+- Candidate Pool: 67 seconds (DJ), 157 seconds (Bakken)
+- Embeddings: 2 minutes
+- **Total Pipeline: ~25 minutes** (was 2+ hours)
+
+---
+
+## [2025-08-12] - Model Training/Inference Consistency Fixes
+### Fixed
+- **Production Warping Mismatch**: 
+  - Training: Applied warping (length^0.6, ppf^0.2) to candidate production curves
+  - Inference: Was averaging raw unwarped curves
+  - Fix: Added warping in evaluation to match training logic
+  - Result: LightGBM improved from 2,460 → 2,257 bbls MAE (DJ Basin)
+
+- **Formation Filtering Inconsistency**:
+  - Baseline: Strict same-formation filtering (AND formation = target)
+  - LightGBM: Allowed cross-formation candidates with feature flag
+  - Fix: Added strict formation filtering to LightGBM evaluation
+  - Training data also updated to filter same-formation only
+
+- **Feature Engineering Inconsistency**:
+  - Problem: Three different feature building implementations (training, inference, evaluation)
+  - Created `src/features/ranking_features.py` as single source of truth
+  - All pipelines now use centralized `build_ranking_features()` function
+  - Ensures consistent feature order and calculation
+
+### Added
+- Centralized feature engineering module (`ranking_features.py`)
+- Standardized 20-feature schema with consistent ordering
+
+### Updated
+- Modified `lightgbm_ranker.py` to use centralized features
+- Modified `model_evaluation.py` to use centralized features  
+- Both models now enforce same-formation constraint
+
+### Results (DJ Basin, 74 wells)
+- **Before fixes**: Baseline 2,018 bbls, LightGBM 2,460 bbls (Baseline wins by 22%)
+- **After fixes**: Baseline 2,438 bbls, LightGBM 2,257 bbls (LightGBM wins by 7.4%)
+
+### Cleaned Up
+- Removed duplicate comparison scripts from root directory
+- Removed temporary log files and debug scripts
+- Kept only `compare_basins.py` as official evaluation entry point
+
+---
+
+## Next Steps
+
+### Immediate
+1. **Retrain LightGBM** with consistent features and same-formation filtering
+2. **Run model comparison on 2024 out-of-sample data**
+   ```bash
+   python -m src.evaluation.model_evaluation --basin both --year 2024
+   ```
+3. **Deploy improved model** (LightGBM now outperforming baseline)
+
+### Model Improvements
+- Investigate why baseline outperforms LightGBM
+- Add formation-specific features to LightGBM
+- Test ensemble approach (baseline + LightGBM)
+- Add temporal features (vintage effects)
+
+### Data Quality
+- Investigate wells without formation data (14% missing)
+- Add formation mapping for wells with NULL values
+- Expand to full 2024 data when available
+
+### System Enhancements
+- Create API endpoint for real-time predictions
+- Add monitoring for pipeline failures
+- Implement incremental updates vs full refresh
+- Add data validation between pipeline stages
