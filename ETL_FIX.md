@@ -14,133 +14,125 @@ Complete redesign of the ETL pipeline to consistently process DJ Basin and Bakke
 ## New Architecture
 
 ```
-Stage 1: Production ETL (Run First)
-S3 Production Data ’ Filter (>2010) ’ Peak Alignment ’ model_prod
-                                    “
-                            production_wells (temp table with well IDs)
+Stage 1: Wells ETL (Run First)
+S3 Well Headers ï¿½ Geographic + Date Filter (spud_date>=2014) ï¿½ basin_wells_list
 
-Stage 2: Wells ETL (Run Second)  
-S3 Well Headers + production_wells ’ Geographic Filter ’ model_wells
+Stage 2: Production ETL (Run Second)  
+S3 Production Data + basin_wells_list ï¿½ Peak Alignment ï¿½ model_prod
 
-Stage 3: Python Processing
-model_wells + model_prod ’ early_production ’ candidate_pools ’ embeddings
+Stage 3: Wells Finalization
+model_prod ï¿½ Update model_wells.first_prod_date
+
+Stage 4: Python Processing
+model_wells + model_prod ï¿½ early_production ï¿½ candidate_pools ï¿½ embeddings
 ```
 
 ## Two-Job Design
 
-### Job 1: Production ETL (`production_etl_glue.py`)
+### Job 1: Wells ETL (`wells_etl_glue.py`)
 
-**Purpose**: Process production data, identify wells with sufficient history, write to model_prod
+**Purpose**: Load well headers with geographic and date filtering, create basin well list
+
+**Inputs**:
+- S3: `s3://.../well_combined/` (well headers parquet)
+
+**Outputs**:
+- `data.model_wells` - Well metadata with basin assignments (first_prod_date updated later)
+- Well IDs list for Production ETL filtering
+
+**Key Logic**:
+```python
+# 1. Read well headers from S3
+well_headers = read_from_s3("s3://.../well_combined/")
+
+# 2. Apply geographic and date filters upfront
+# DJ Basin: Colorado wells in specific bounds, spud_date >= 2014
+dj_filter = (
+    (F.col("state_abbr") == "CO") & 
+    (F.col("surface_lat").between(39.51, 42.19)) &
+    (F.col("surface_lng").between(-105.13, -101.99)) &
+    (F.col("spud_date") >= "2014-01-01")
+)
+
+# Bakken: ND/MT wells in specific bounds, spud_date >= 2014
+bakken_filter = (
+    (F.col("state_abbr").isin(["ND", "MT"])) &
+    (F.col("surface_lat").between(46.66, 48.99)) &
+    (F.col("surface_lng").between(-105.26, -102.00)) &
+    (F.col("spud_date") >= "2014-01-01")
+)
+
+# 3. Filter to target basin wells only
+basin_wells = well_headers.filter(dj_filter | bakken_filter)
+
+# 4. Assign basin names and create model_wells
+model_wells = basin_wells.withColumn(
+    "basin",
+    F.when(dj_filter, "dj")
+     .when(bakken_filter, "bakken")
+).withColumn(
+    "basin_name", 
+    F.when(F.col("basin") == "dj", "dj_basin")
+     .when(F.col("basin") == "bakken", "bakken")
+)
+
+# 5. Write to model_wells (first_prod_date updated later)
+```
+
+### Job 2: Production ETL (`production_etl_glue.py`)
+
+**Purpose**: Process production data for basin wells, write to model_prod
 
 **Inputs**:
 - S3: `s3://.../well_prod_liq_master/` (oil production parquet)
 - S3: `s3://.../well_prod_gas_master/` (gas production parquet)
-- PostgreSQL: `data.model_wells` (for basin filtering)
+- PostgreSQL: `data.model_wells` (get well IDs from Job 1)
 
 **Outputs**:
-- `data.model_prod` - Production data with peak alignment and basin fields
-- `data.production_wells` - Temp table with well IDs that have production
+- `data.model_prod` - Production data with peak alignment and basin info
 
 **Key Logic**:
 ```python
-# 1. Read and union oil/gas production
+# 1. Get well IDs from model_wells (basin wells from Job 1)
+basin_wells = spark.sql("SELECT well_id, basin, basin_name FROM data.model_wells")
+
+# 2. Read and union oil/gas production
 production_df = oil_df.union(gas_df)
 
-# 2. Filter to modern wells only
-production_filtered = production_df.filter(
-    F.col("production_date") >= "2010-01-01"
+# 3. Filter to basin wells only (huge data reduction!)
+production_filtered = production_df.join(
+    basin_wells.select("well_id"),
+    production_df["state_well_id"] == basin_wells["well_id"],
+    "inner"
+).filter(
+    F.col("production_date") >= "2014-01-01"
 )
 
-# 3. Identify wells with 9+ months production
+# 4. Identify wells with 9+ months production
 wells_with_production = production_filtered.groupBy("state_well_id").agg(
-    F.min("production_date").alias("first_prod_date"),  # ACTUAL first prod date
     F.countDistinct("production_date").alias("months_count")
 ).filter(F.col("months_count") >= 9)
 
-# 4. Write well list to temp table
-wells_with_production.write.mode("overwrite").saveAsTable("data.production_wells")
-
-# 5. Filter production to these wells
+# 5. Filter to wells with sufficient production history
 production_to_process = production_filtered.join(
     wells_with_production.select("state_well_id"),
     on="state_well_id",
     how="inner"
 )
 
-# 6. Apply peak month detection (months 0-6)
-# 7. Reset production months from peak (peak = month 0)
-# 8. Join with model_wells to get basin information
-# 9. Write to model_prod with basin and basin_name fields
+# 6. Join with basin info and apply peak alignment
+production_with_basin = production_to_process.join(
+    basin_wells,
+    production_to_process["state_well_id"] == basin_wells["well_id"],
+    "left"
+)
+
+# 7. Apply peak month detection and write to model_prod
 ```
 
-**Basin-Specific Logic**:
-- Peak month window: 7 months for DJ, 6 months for Bakken
-- Currently hardcoded to 7 (needs fixing for basin-specific)
-
-### Job 2: Wells ETL (`wells_etl_glue.py`)
-
-**Purpose**: Load well headers for wells that have production, assign basins based on geography
-
-**Inputs**:
-- S3: `s3://.../well_combined/` (well headers parquet)
-- PostgreSQL: `data.production_wells` (from Job 1)
-
-**Outputs**:
-- `data.model_wells` - Well metadata with basin assignments
-
-**Key Logic**:
-```python
-# 1. Read well IDs from production_wells temp table
-prod_wells = spark.table("data.production_wells")
-# Has: state_well_id, first_prod_date, months_count
-
-# 2. Read well headers from S3
-well_headers = read_from_s3("s3://.../well_combined/")
-
-# 3. Inner join - only wells with production
-wells_with_prod = well_headers.join(
-    prod_wells,
-    well_headers["well_api"] == prod_wells["state_well_id"],
-    "inner"
-)
-
-# 4. Apply geographic filters for basin assignment
-# DJ Basin: Colorado wells in lat 39.51-42.19, lon -105.13 to -101.99
-dj_filter = (
-    (F.col("state_abbr") == "CO") & 
-    (F.col("surface_lat").between(39.51, 42.19)) &
-    (F.col("surface_lng").between(-105.13, -101.99))
-)
-
-# Bakken: ND/MT wells in lat 46.66-48.99, lon -105.26 to -102.00
-bakken_filter = (
-    (F.col("state_abbr").isin(["ND", "MT"])) &
-    (F.col("surface_lat").between(46.66, 48.99)) &
-    (F.col("surface_lng").between(-105.26, -102.00))
-)
-
-# 5. Assign basin names
-wells_with_basin = wells_with_prod.withColumn(
-    "basin",
-    F.when(dj_filter, "dj")
-     .when(bakken_filter, "bakken")
-     .otherwise(None)
-).filter(F.col("basin").isNotNull())
-
-# 6. Use first_prod_date from production data (not metadata)
-wells_final = wells_with_basin.select(
-    F.col("well_api").alias("well_id"),
-    # ... other well header fields ...
-    F.col("first_prod_date"),  # From production_wells, not well headers!
-    F.col("basin"),
-    F.when(F.col("basin") == "dj", "dj_basin")
-     .when(F.col("basin") == "bakken", "bakken")
-     .alias("basin_name")
-)
-
-# 7. Write to model_wells
-wells_final.write.mode("overwrite").saveAsTable("data.model_wells")
-```
+**Peak Detection Logic**:
+- Peak month window: 7 months (0-6) for all basins
+- Consistent approach across all regions
 
 ## Basin Naming Convention
 
@@ -185,13 +177,16 @@ psql -f truncate_all_tables.sql
 aws s3 cp production_etl_glue.py s3://aws-glue-assets-.../scripts/
 aws s3 cp wells_etl_glue.py s3://aws-glue-assets-.../scripts/
 
-# 3. Run Production ETL (60-90 minutes)
-aws glue start-job-run --job-name production-etl-job
-
-# 4. Run Wells ETL (30-45 minutes)  
+# 3. Run Wells ETL (30-45 minutes)
 aws glue start-job-run --job-name wells-etl-job
 
-# 5. Run Python processing
+# 4. Run Production ETL (60-90 minutes)
+aws glue start-job-run --job-name production-etl-job
+
+# 5. Update model_wells with actual production dates
+psql -c "UPDATE data.model_wells SET first_prod_date = (SELECT MIN(prod_date) FROM data.model_prod WHERE model_prod.well_id = model_wells.well_id)"
+
+# 6. Run Python processing
 python -m src.data.early_production --basin dj_basin
 python -m src.data.early_production --basin bakken
 python -m src.data.candidate_pool --basin dj_basin
@@ -232,9 +227,9 @@ python -m src.features.embeddings
 ## Critical Notes
 
 1. **Well ID Mapping**: Verify that `state_well_id` (production) matches `well_api` (headers)
-2. **Temp Table**: `data.production_wells` must persist between Job 1 and Job 2
+2. **Job Dependencies**: Production ETL must run after Wells ETL completes
 3. **Overwrite Mode**: Both jobs use overwrite since we're starting fresh
-4. **Peak Detection**: Currently uses 7 months for all basins - needs basin-specific logic
+4. **Peak Detection**: Uses 7 months (0-6) consistently for all basins
 5. **No data.wells**: This table should NOT be used for anything
 
 ## Validation Queries
@@ -247,10 +242,14 @@ SELECT basin, basin_name, COUNT(*)
 FROM data.model_wells 
 GROUP BY basin, basin_name;
 
--- Verify production has basin info
-SELECT basin, basin_name, COUNT(DISTINCT well_id) as wells, COUNT(*) as records
-FROM data.model_prod
-GROUP BY basin, basin_name;
+-- Verify wells and production match
+SELECT 
+    w.basin, w.basin_name, 
+    COUNT(DISTINCT w.well_id) as wells, 
+    COUNT(DISTINCT p.well_id) as prod_wells
+FROM data.model_wells w
+LEFT JOIN data.model_prod p ON w.well_id = p.well_id
+GROUP BY w.basin, w.basin_name;
 
 -- Check date consistency
 SELECT w.well_id, w.first_prod_date, MIN(p.prod_date) as actual_min

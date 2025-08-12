@@ -5,9 +5,66 @@
 ### What It Does
 This system predicts oil & gas production for new wells by finding and analyzing similar historical wells ("analogs"). Originally built for the DJ Basin, it now supports multiple basins through a configurable architecture. It uses a combination of spatial analysis, production curve characterization, and machine learning to forecast the first 9 months of production.
 
+### Complete Pipeline: From Raw Data to Model Comparison
+
+#### Step 1: Data Ingestion (AWS Glue ETL)
+```
+S3 Parquet Files → AWS Glue → PostgreSQL
+```
+1. **Wells ETL** (`etl_scripts/wells_etl_glue.py`): 
+   - Reads well metadata from S3 parquet files
+   - Filters by basin (DJ/Bakken) using lat/lon boundaries
+   - Loads ~23,961 wells into `model_wells` table (~3 minutes)
+
+2. **Production ETL** (`etl_scripts/production_etl_glue.py`):
+   - Reads monthly production from S3 parquet files  
+   - Joins to `model_wells` to filter by basin wells only
+   - Loads ~1.5M records into `model_prod` table (~18 minutes)
+   - Updates `first_prod_date` using MIN(prod_date)
+
+#### Step 2: Data Preparation
+3. **Early Production Arrays** (`src/data/early_production.py`):
+   - Identifies peak production month (0-6 window)
+   - Aligns all wells to peak month
+   - Creates 9-month production arrays
+   - Result: 10,078 wells in `early_rates` table
+
+#### Step 3: Feature Engineering
+4. **Analog Candidates** (`src/data/candidate_pool.py`):
+   - Finds wells within 20 miles of each target
+   - Pre-computes distance, formation match, operator match
+   - Result: 2.47M candidate pairs in `analog_candidates` table
+
+5. **Curve Embeddings** (`src/features/embeddings.py`):
+   - PCA on production curves (4 components)
+   - Captures decline curve shapes
+   - Result: 10,078 embeddings in `curve_embeddings` table
+
+6. **Feature Builder** (`src/features/feature_builder.py`):
+   - Creates 34 features (spatial, geological, completion)
+   - Includes ratios and interactions for ML
+
+#### Step 4: Model Training & Evaluation
+7. **Baseline Model** (`src/models/baseline.py`):
+   - Simple distance-weighted averaging
+   - Selects top 20 closest analogs
+   - Applies production warping (lateral length, proppant)
+
+8. **LightGBM Model** (`src/models/lightgbm_ranker.py`):
+   - Machine learning ranking model
+   - Uses all 34 features to score analogs
+   - Selects top 20 by ML score
+
+#### Step 5: Model Comparison
+9. **Evaluation** (H1 2024 test set - 304 wells):
+   - Weighted MAE metric (early months weighted higher)
+   - **Baseline: 2,018 bbls/month median error**
+   - **LightGBM: 2,460 bbls/month median error**
+   - **Result: Baseline outperforms ML by 22%**
+
 ### How It Works
 
-#### 1. Data Pipeline
+#### Data Pipeline
 ```
 Energy Domain S3 → AWS Glue ETL → PostgreSQL → Model Pipeline → Predictions
 ```
@@ -105,7 +162,7 @@ dde-model/
 
 ### 2025-08-11 - Multi-Basin Configuration System
 - **NEW:** Created `BasinConfig` class for basin-specific parameters
-  - Supports DJ Basin, Permian, Bakken, Eagle Ford configurations
+  - Supports DJ Basin, Bakken, Eagle Ford configurations
   - Configurable distance limits (15-25 miles per basin)
   - Basin-specific lateral tolerances, vintage years, formations
   - Warping coefficients tuned per basin geology
@@ -127,7 +184,6 @@ dde-model/
 - **RESULT:** System ready for multi-basin deployment
   - DJ Basin functionality unchanged (backward compatible)
   - Successfully tested with 2024 wells: 20 analogs found, predictions generated
-  - Permian Basin can be deployed immediately with parameter change
 
 ### 2025-08-11 - Evaluation Metric Overhaul
 - **NEW:** Implemented Weighted Mean Absolute Error (MAE) metric
@@ -176,9 +232,8 @@ dde-model/
 ### Immediate Priorities
 1. **Run basin migration** - Execute `python run_basin_migration.py` to add basin_name columns
 2. **Deploy baseline model** to production (best performer)
-3. **Load Permian data** - Update ETL with `--TARGET_BASINS "Permian Basin"`
-4. **Retrain LightGBM** with weighted MAE objective
-5. **Expand coverage** to remaining ~1,200 wells without candidates
+3. **Retrain LightGBM** with weighted MAE objective
+4. **Expand coverage** to remaining ~1,200 wells without candidates
 
 ### Model Improvements
 - Ensemble baseline + LightGBM predictions
@@ -198,7 +253,7 @@ dde-model/
 
 | Metric | Value |
 |--------|-------|
-| **Basins Supported** | **4 (DJ, Permian, Bakken, Eagle Ford)** |
+| **Basins Supported** | **3 (DJ, Bakken, Eagle Ford)** |
 | Total wells in system | 13,545 |
 | Wells with 9-month arrays | 10,078 |
 | Production records | ~1M |
@@ -217,3 +272,41 @@ dde-model/
 - **ML:** Python 3.8+, scikit-learn, LightGBM
 - **Key Libraries:** psycopg2, pandas, numpy
 - **Infrastructure:** AWS S3, AWS Glue, PostgreSQL RDS
+
+---
+
+## [2025-01-12] - Wells-First ETL Pipeline Implementation
+### Added
+- Complete redesign of ETL pipeline with wells-first approach for massive performance gains
+- py4j integration for executing UPDATE statements directly in AWS Glue
+- Geographic filtering using precise lat/lon boundaries for DJ Basin and Bakken
+- Consistent basin naming convention: "dj"/"bakken" for basin, "dj_basin"/"bakken" for basin_name
+- Production-based first_prod_date calculation using actual MIN(prod_date) from production data
+- Peak month alignment logic (0-6 month window) for consistent production curve analysis
+
+### Changed
+- **BREAKING**: Switched from production-first to wells-first ETL execution order
+- ETL pipeline now requires Wells ETL to run before Production ETL
+- Eliminated dependency on data.wells table - direct S3 to model_wells loading
+- Reduced quality filters to essential only (lat/lon not null) for better data retention
+- Updated job configurations to use clean script names (removed _new versions)
+
+### Performance Improvements  
+- **Wells ETL**: Reduced from 30-45 minutes to ~3 minutes (90% improvement)
+- **Production ETL**: Reduced from 60-90 minutes to ~18 minutes (75% improvement)  
+- **Total Pipeline**: Reduced from 90+ minutes to ~20 minutes (78% improvement)
+- Massive data reduction: Filter production data to basin wells only (23,961 wells vs millions)
+
+### Fixed
+- Resolved circular dependency between Wells ETL and Production ETL
+- Fixed inconsistent basin naming across tables
+- Eliminated secondary quality filters that were removing all valid wells
+- Resolved UPDATE statement execution in AWS Glue using py4j workaround
+- Fixed column mapping issues (sub_basin, primary_fluid, formation fields)
+
+### Technical Details
+- Wells loaded: 23,961 total wells (DJ: 9,454, Bakken: 11,156 with production)
+- Production records: 1,531,769 total records (DJ: 690,673, Bakken: 841,096)
+- First production dates updated: 20,610 wells via py4j UPDATE statements
+- Geographic filtering: CO (39.51-42.19°N, -105.13 to -101.99°W), ND/MT (46.66-48.99°N, -105.26 to -102.00°W)
+- Date filtering: spud_date >= 2014-01-01, production_date >= 2014-01-01

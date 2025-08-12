@@ -1,3 +1,9 @@
+"""
+AWS Glue ETL: Production Processing (Wells-First Approach)
+Process production data for basin wells identified by Wells ETL
+This runs SECOND after Wells ETL creates the basin well filter list
+"""
+
 import sys
 from awsglue.transforms import *
 from awsglue.utils import getResolvedOptions
@@ -24,14 +30,8 @@ args = getResolvedOptions(sys.argv, [
     'POSTGRES_DATABASE',
     'POSTGRES_USERNAME',
     'POSTGRES_PASSWORD',
-    'POSTGRES_TABLE',
     'BATCH_SIZE'
 ])
-
-# Get optional basin parameter (defaults to DJ Basin)
-optional_args = getResolvedOptions(sys.argv, ['TARGET_BASINS'], optional=True)
-target_basins = optional_args.get('TARGET_BASINS', 'Denver Basin').split(',')
-logger.info(f"Target basins: {target_basins}")
 
 # Initialize Glue context
 sc = SparkContext()
@@ -40,14 +40,35 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-logger.info(f"Starting production ETL job: {args['JOB_NAME']}")
+logger.info(f"Starting Production ETL job: {args['JOB_NAME']}")
 logger.info(f"Oil path: {args['S3_OIL_PATH']}")
 logger.info(f"Gas path: {args['S3_GAS_PATH']}")
-logger.info(f"PostgreSQL target: {args['POSTGRES_HOST']}:{args['POSTGRES_PORT']}/{args['POSTGRES_DATABASE']}")
-logger.info(f"Processing basins: {', '.join(target_basins)}")
 
 try:
-    # Step 1: Read oil production data from S3
+    # Step 1: Get basin well IDs from model_wells (created by Wells ETL)
+    logger.info("Reading basin well IDs from model_wells...")
+    postgres_url = f"jdbc:postgresql://{args['POSTGRES_HOST']}:{args['POSTGRES_PORT']}/{args['POSTGRES_DATABASE']}"
+    
+    basin_wells_df = spark.read \
+        .format("jdbc") \
+        .option("url", postgres_url) \
+        .option("dbtable", "data.model_wells") \
+        .option("user", args['POSTGRES_USERNAME']) \
+        .option("password", args['POSTGRES_PASSWORD']) \
+        .option("driver", "org.postgresql.Driver") \
+        .load() \
+        .select("well_id", "basin", "basin_name")  # Get basin info for later join
+    
+    basin_well_count = basin_wells_df.count()
+    logger.info(f"Basin wells to process: {basin_well_count:,}")
+    
+    # Log basin distribution
+    basin_distribution = basin_wells_df.groupBy("basin", "basin_name").count().collect()
+    logger.info("Basin well distribution:")
+    for row in basin_distribution:
+        logger.info(f"  {row['basin']} ({row['basin_name']}): {row['count']:,} wells")
+    
+    # Step 2: Read oil production data from S3
     logger.info("Reading oil production data from S3...")
     oil_dynamic_frame = glueContext.create_dynamic_frame.from_options(
         format_options={
@@ -62,7 +83,7 @@ try:
         transformation_ctx="oil_source"
     )
     
-    # Step 2: Read gas production data from S3
+    # Step 3: Read gas production data from S3
     logger.info("Reading gas production data from S3...")
     gas_dynamic_frame = glueContext.create_dynamic_frame.from_options(
         format_options={
@@ -79,62 +100,45 @@ try:
     
     logger.info("Successfully read production data from S3")
     
-    # Step 3: Convert to Spark DataFrames
+    # Step 4: Convert to Spark DataFrames and clean
     oil_df = oil_dynamic_frame.toDF()
     gas_df = gas_dynamic_frame.toDF()
     
-    # Step 4: Add product type and clean data
-    logger.info("Processing oil and gas data...")
+    logger.info("Processing and cleaning production data...")
     
-    # Add product type to distinguish oil vs gas
+    # Clean and standardize oil data
     oil_clean = oil_df.select(
         F.col("state_well_id").alias("well_id"),
         F.col("production_date").alias("prod_date"),
         F.col("production_quantity").alias("oil_bbls"),
         F.lit(None).cast("double").alias("gas_mcf")
     ).filter(
-        F.col("prod_date") >= F.lit("2000-01-01")  # Filter to modern wells only
+        F.col("prod_date") >= F.lit("2014-01-01")  # Filter early for performance
     )
     
+    # Clean and standardize gas data
     gas_clean = gas_df.select(
         F.col("state_well_id").alias("well_id"), 
         F.col("production_date").alias("prod_date"),
         F.lit(None).cast("double").alias("oil_bbls"),
         F.col("production_quantity").alias("gas_mcf")
     ).filter(
-        F.col("prod_date") >= F.lit("2000-01-01")  # Filter to modern wells only
+        F.col("prod_date") >= F.lit("2014-01-01")  # Filter early for performance
     )
-    
-    logger.info("Data processing completed")
     
     # Step 5: Union oil and gas data
     logger.info("Merging oil and gas production data...")
     production_df = oil_clean.union(gas_clean)
     
-    # Step 6: Filter to DJ Basin wells using geographic criteria (not well_type)
-    logger.info("Reading model wells for DJ Basin filtering...")
-    
-    # Read model_wells table to get DJ Basin wells by geography, not well_type
-    postgres_url = f"jdbc:postgresql://{args['POSTGRES_HOST']}:{args['POSTGRES_PORT']}/{args['POSTGRES_DATABASE']}"
-    
-    dj_basin_wells_df = spark.read \
-        .format("jdbc") \
-        .option("url", postgres_url) \
-        .option("dbtable", "data.model_wells") \
-        .option("user", args['POSTGRES_USERNAME']) \
-        .option("password", args['POSTGRES_PASSWORD']) \
-        .option("driver", "org.postgresql.Driver") \
-        .load() \
-        .filter(F.col("basin").isin(target_basins)) \
-        .select("well_id")
-    
-    logger.info("Filtering production data to DJ Basin wells with actual production...")
-    # Filter production data to only include DJ Basin wells that have production data
+    # Step 6: MASSIVE data reduction - filter to basin wells only
+    logger.info("Filtering production to basin wells only (major data reduction)...")
     production_filtered = production_df.join(
-        dj_basin_wells_df,
+        basin_wells_df.select("well_id"),
         on="well_id",
-        how="leftsemi"  # Only keep production records for DJ Basin wells
+        how="inner"  # Only keep production for basin wells
     )
+    
+    logger.info("Production data filtered to basin wells")
     
     # Step 7: Aggregate by well and date to combine oil and gas into single records
     logger.info("Aggregating production data by well and date...")
@@ -143,13 +147,30 @@ try:
         F.max("gas_mcf").alias("gas_mcf")
     )
     
-    # Step 8: Calculate correct prod_month based on peak oil production
-    logger.info("Calculating production month indices from peak production...")
+    # Step 8: Identify wells with sufficient production history (9+ months)
+    logger.info("Identifying wells with 9+ months of production...")
+    
+    wells_with_production = production_agg.groupBy("well_id").agg(
+        F.countDistinct("prod_date").alias("months_count")
+    ).filter(F.col("months_count") >= 9)
+    
+    valid_well_count = wells_with_production.count()
+    logger.info(f"Wells with 9+ months production: {valid_well_count:,}")
+    
+    # Filter production to wells with sufficient history
+    production_sufficient = production_agg.join(
+        wells_with_production.select("well_id"),
+        on="well_id",
+        how="inner"
+    )
+    
+    # Step 9: Calculate peak month alignment
+    logger.info("Calculating production month indices and peak alignment...")
     
     # Get first production date for each well
     window_spec = Window.partitionBy("well_id").orderBy("prod_date")
     
-    production_with_first = production_agg.withColumn(
+    production_with_first = production_sufficient.withColumn(
         "first_prod_date", F.first("prod_date").over(window_spec)
     )
     
@@ -164,7 +185,7 @@ try:
         ).cast("bigint")
     )
     
-    # Step 8a: Find peak oil production month (within first 7 months)
+    # Step 10: Find peak oil production month (within first 7 months: 0-6)
     logger.info("Finding peak oil production month for each well...")
     
     # Filter to first 7 months (0-6) and find peak
@@ -191,31 +212,18 @@ try:
         F.col("oil_bbls").alias("peak_oil_production")
     )
     
-    # Log statistics about peak months
+    # Log peak month statistics
     peak_stats = peak_months.groupBy("peak_month").count().orderBy("peak_month").collect()
     logger.info(f"Peak month distribution: {peak_stats}")
     
-    # Log additional statistics
-    peak_month_summary = peak_months.agg(
-        F.count("*").alias("total_wells"),
-        F.avg("peak_month").alias("avg_peak_month"),
-        F.avg("peak_oil_production").alias("avg_peak_oil")
-    ).collect()[0]
-    logger.info(f"Peak month summary - Total wells: {peak_month_summary['total_wells']}, "
-                f"Avg peak month: {peak_month_summary['avg_peak_month']:.2f}, "
-                f"Avg peak oil: {peak_month_summary['avg_peak_oil']:.0f} bbls")
-    
-    # All wells with identified peaks are valid (peak is within 0-6 by construction)
-    valid_peak_wells = peak_months
-    
     # Join back with production data
     production_with_peak = production_with_initial_month.join(
-        valid_peak_wells,
+        peak_months,
         on="well_id",
         how="inner"  # Only keep wells with valid peak months
     )
     
-    # Step 8b: Reset prod_month to start from peak
+    # Step 11: Reset prod_month to start from peak (peak month becomes month 0)
     logger.info("Resetting production month indices from peak...")
     
     # Calculate new prod_month (peak month becomes month 0)
@@ -227,24 +235,17 @@ try:
         (F.col("initial_prod_month") - F.col("peak_month")).cast("bigint")
     )
     
-    # Join with wells to get basin information
-    wells_basin_df = spark.read \
-        .format("jdbc") \
-        .option("url", postgres_url) \
-        .option("dbtable", "(SELECT well_id, basin, basin_name FROM data.model_wells) as wells") \
-        .option("user", args['POSTGRES_USERNAME']) \
-        .option("password", args['POSTGRES_PASSWORD']) \
-        .option("driver", "org.postgresql.Driver") \
-        .load()
+    # Step 12: Add basin information and finalize
+    logger.info("Adding basin information and finalizing dataset...")
     
-    # Add basin information and finalize
+    # Join with basin information
     production_with_basin = production_peak_aligned.join(
-        wells_basin_df,
+        basin_wells_df.select("well_id", "basin", "basin_name"),
         on="well_id",
         how="left"
     )
     
-    # Remove temporary columns and add water/timestamp
+    # Final data selection
     production_final = production_with_basin.select(
         "well_id",
         "prod_date",
@@ -262,33 +263,91 @@ try:
     # Log final statistics
     well_count = production_final.select("well_id").distinct().count()
     record_count = production_final.count()
-    logger.info(f"Final dataset: {well_count} wells, {record_count} production records")
+    logger.info(f"Final dataset: {well_count:,} wells, {record_count:,} production records")
     
-    logger.info("Production data aggregation completed")
+    # Basin statistics
+    final_basin_stats = production_final.groupBy("basin", "basin_name").agg(
+        F.countDistinct("well_id").alias("wells"),
+        F.count("*").alias("records")
+    ).collect()
     
-    # Step 9: Convert back to DynamicFrame
-    production_dynamic_frame = DynamicFrame.fromDF(production_final, glueContext, "production_data")
+    logger.info("Final production data by basin:")
+    for row in final_basin_stats:
+        logger.info(f"  {row['basin']} ({row['basin_name']}): {row['wells']:,} wells, {row['records']:,} records")
     
-    # Step 10: Clear existing data and write to PostgreSQL
-    logger.info("Clearing existing data from target table...")
+    # Step 13: Write to PostgreSQL
+    logger.info("Writing to model_prod table...")
     
-    # First, truncate the existing table using JDBC
-    postgres_url = f"jdbc:postgresql://{args['POSTGRES_HOST']}:{args['POSTGRES_PORT']}/{args['POSTGRES_DATABASE']}"
-    
-    # Create a connection to truncate the table
     production_final.write \
         .mode("overwrite") \
         .format("jdbc") \
         .option("url", postgres_url) \
-        .option("dbtable", args['POSTGRES_TABLE']) \
+        .option("dbtable", "data.model_prod") \
         .option("user", args['POSTGRES_USERNAME']) \
         .option("password", args['POSTGRES_PASSWORD']) \
         .option("driver", "org.postgresql.Driver") \
-        .option("truncate", "true") \
+        .option("batchsize", args.get('BATCH_SIZE', '10000')) \
         .save()
     
-    logger.info(f"Table {args['POSTGRES_TABLE']} cleared and new data written")
+    # Step 14: Update first_prod_date in model_wells from actual production data
+    logger.info("Updating first_prod_date in model_wells from production data...")
     
+    # Calculate first production date for each well
+    first_prod_dates = production_final.groupBy("well_id").agg(
+        F.min("prod_date").alias("first_prod_date")
+    )
+    
+    wells_to_update = first_prod_dates.count()
+    logger.info(f"Calculated first production dates for {wells_to_update:,} wells")
+    
+    # Write first_prod_dates to a temporary table in PostgreSQL
+    first_prod_dates.write \
+        .mode("overwrite") \
+        .format("jdbc") \
+        .option("url", postgres_url) \
+        .option("dbtable", "temp_first_prod_dates") \
+        .option("user", args['POSTGRES_USERNAME']) \
+        .option("password", args['POSTGRES_PASSWORD']) \
+        .option("driver", "org.postgresql.Driver") \
+        .save()
+    
+    # Execute UPDATE using py4j direct JDBC connection
+    from py4j.java_gateway import java_import
+    
+    # Import Java SQL classes
+    java_import(sc._gateway.jvm, "java.sql.Connection")
+    java_import(sc._gateway.jvm, "java.sql.DriverManager")
+    java_import(sc._gateway.jvm, "java.sql.SQLException")
+    
+    # Create direct JDBC connection
+    jdbc_url = f"jdbc:postgresql://{args['POSTGRES_HOST']}:{args['POSTGRES_PORT']}/{args['POSTGRES_DATABASE']}"
+    conn = sc._gateway.jvm.DriverManager.getConnection(
+        jdbc_url,
+        args['POSTGRES_USERNAME'], 
+        args['POSTGRES_PASSWORD']
+    )
+    
+    # Execute UPDATE statement
+    stmt = conn.createStatement()
+    update_query = """
+    UPDATE data.model_wells 
+    SET first_prod_date = temp.first_prod_date
+    FROM temp_first_prod_dates temp
+    WHERE data.model_wells.well_id = temp.well_id
+    """
+    
+    rows_updated = stmt.executeUpdate(update_query)
+    logger.info(f"Updated first_prod_date for {rows_updated:,} wells")
+    
+    # Clean up temp table
+    cleanup_query = "DROP TABLE IF EXISTS temp_first_prod_dates"
+    stmt.executeUpdate(cleanup_query)
+    
+    # Close connection
+    stmt.close()
+    conn.close()
+    
+    logger.info(f"✅ first_prod_date updated successfully for {wells_to_update:,} wells in model_wells")
     logger.info("Production ETL job completed successfully")
     
 except Exception as e:
