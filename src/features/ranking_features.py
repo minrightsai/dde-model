@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 def build_ranking_features(
     candidates_df: pd.DataFrame,
     target_well: Dict,
-    embeddings_df: Optional[pd.DataFrame] = None
+    peak_features_df: Optional[pd.DataFrame] = None
 ) -> pd.DataFrame:
     """
     Build standardized features for ranking model
@@ -30,6 +30,10 @@ def build_ranking_features(
             - formation or candidate_formation: Formation name
             - operator_name or candidate_operator: Operator
             - first_prod_date or candidate_first_prod: First production date
+            - wells_within_1mi_at_start: Wells within 1 mile when candidate started
+            - wells_within_3mi_at_start: Wells within 3 miles when candidate started
+            - distance_to_nearest_at_start: Distance to nearest well when candidate started
+            - distance_to_second_nearest_at_start: Distance to 2nd nearest when candidate started
             - For training: length_ratio, ppf_ratio, formation_match, etc may be pre-computed
         target_well: Dict with target well properties:
             - lateral_length: Target lateral length
@@ -37,7 +41,9 @@ def build_ranking_features(
             - formation: Target formation
             - operator_name: Target operator
             - first_prod_date: Target first production date
-        embeddings_df: Optional DataFrame with curve embeddings
+            - peak_oil: Target peak oil (if available)
+            - oil_decline_rate: Target decline rate (if available)
+        peak_features_df: Optional DataFrame with peak production features
     
     Returns:
         DataFrame with standardized features
@@ -130,33 +136,99 @@ def build_ranking_features(
     
     features['abs_vintage_gap'] = np.abs(features['vintage_gap_years'])
     
-    # Embeddings (if available)
-    if embeddings_df is not None and 'candidate_embedding' in candidates_df.columns:
-        # Parse embedding arrays
-        embeddings = np.vstack(candidates_df['candidate_embedding'].apply(
-            lambda x: np.array(x) if x is not None else np.zeros(4)
-        ))
-        for i in range(min(4, embeddings.shape[1])):
-            features[f'embedding_pc{i+1}'] = embeddings[:, i]
+    # Peak production features (replacing embeddings)
+    if peak_features_df is not None:
+        # Merge peak features if available
+        if 'candidate_id' in candidates_df.columns:
+            peak_data = peak_features_df[peak_features_df['well_id'].isin(candidates_df['candidate_id'])]
+            peak_data = peak_data.set_index('well_id').reindex(candidates_df['candidate_id']).reset_index(drop=True)
+        elif 'well_id' in candidates_df.columns:
+            peak_data = peak_features_df[peak_features_df['well_id'].isin(candidates_df['well_id'])]
+            peak_data = peak_data.set_index('well_id').reindex(candidates_df['well_id']).reset_index(drop=True)
+        else:
+            peak_data = pd.DataFrame()
+        
+        if not peak_data.empty:
+            features['candidate_peak_oil'] = peak_data['peak_oil'].fillna(0)
+            features['candidate_peak_gas'] = peak_data['peak_gas'].fillna(0)
+            
+            # Peak ratios if target has peak data
+            target_peak_oil = target_well.get('peak_oil', 0)
+            if target_peak_oil > 0:
+                features['peak_oil_ratio'] = features['candidate_peak_oil'] / (target_peak_oil + 1)
+                features['log_peak_oil_ratio'] = np.log(features['peak_oil_ratio'].clip(lower=0.1))
+            else:
+                features['peak_oil_ratio'] = 1.0
+                features['log_peak_oil_ratio'] = 0.0
+            
+            features['peak_month_diff'] = peak_data['peak_oil_month'].fillna(3) - target_well.get('peak_oil_month', 3)
+            features['early_peak'] = (peak_data['peak_oil_month'] <= 3).astype(int).fillna(1)
+            
+            # Decline rate difference
+            target_decline = target_well.get('oil_decline_rate', 0.7)
+            features['decline_rate_diff'] = peak_data['oil_decline_rate'].fillna(0.7) - target_decline
+        else:
+            # Default values if no peak data
+            features['candidate_peak_oil'] = 0
+            features['candidate_peak_gas'] = 0
+            features['peak_oil_ratio'] = 1.0
+            features['log_peak_oil_ratio'] = 0.0
+            features['peak_month_diff'] = 0
+            features['early_peak'] = 1
+            features['decline_rate_diff'] = 0
     else:
-        # Add zero embeddings if expected
-        for i in range(4):
-            features[f'embedding_pc{i+1}'] = 0.0
+        # Add zero peak features if not available
+        features['candidate_peak_oil'] = 0
+        features['candidate_peak_gas'] = 0
+        features['peak_oil_ratio'] = 1.0
+        features['log_peak_oil_ratio'] = 0.0
+        features['peak_month_diff'] = 0
+        features['early_peak'] = 1
+        features['decline_rate_diff'] = 0
+    
+    # Time-aware well spacing features
+    if 'wells_within_1mi_at_start' in candidates_df.columns:
+        features['wells_within_1mi_at_start'] = candidates_df['wells_within_1mi_at_start'].fillna(0)
+    else:
+        features['wells_within_1mi_at_start'] = 0
+    
+    if 'wells_within_3mi_at_start' in candidates_df.columns:
+        features['wells_within_3mi_at_start'] = candidates_df['wells_within_3mi_at_start'].fillna(0)
+    else:
+        features['wells_within_3mi_at_start'] = 0
+    
+    if 'distance_to_nearest_at_start' in candidates_df.columns:
+        features['distance_to_nearest_at_start'] = candidates_df['distance_to_nearest_at_start'].fillna(999)
+    else:
+        features['distance_to_nearest_at_start'] = 999
+    
+    if 'distance_to_second_nearest_at_start' in candidates_df.columns:
+        features['distance_to_second_nearest_at_start'] = candidates_df['distance_to_second_nearest_at_start'].fillna(999)
+    else:
+        features['distance_to_second_nearest_at_start'] = 999
     
     # Interaction features
     features['distance_x_formation'] = features['distance_mi'] * features['same_formation']
     features['distance_x_operator'] = features['distance_mi'] * features['same_operator']
     features['length_x_ppf'] = features['abs_log_length_ratio'] * features['log_ppf_ratio']
     
-    # Ensure consistent feature order
+    # Ensure consistent feature order (17 features as per MODEL_TWEAKS.md)
     expected_features = [
-        'distance_mi', 'distance_km', 'log_distance',
-        'length_ratio', 'length_delta', 'log_length_ratio', 'abs_log_length_ratio',
+        # Distance (2)
+        'distance_mi', 'log_distance',
+        # Lateral Length (3)
+        'length_delta', 'log_length_ratio', 'abs_log_length_ratio',
+        # Completion Design (2)
         'ppf_ratio', 'log_ppf_ratio',
-        'same_formation', 'same_operator',
-        'vintage_gap_years', 'abs_vintage_gap',
-        'embedding_pc1', 'embedding_pc2', 'embedding_pc3', 'embedding_pc4',
-        'distance_x_formation', 'distance_x_operator', 'length_x_ppf'
+        # Operator (1)
+        'same_operator',
+        # Temporal (1)
+        'vintage_gap_years',
+        # Peak Production (4)
+        'candidate_peak_oil', 'peak_oil_ratio', 'log_peak_oil_ratio', 'decline_rate_diff',
+        # Time-Aware Well Spacing (4)
+        'wells_within_1mi_at_start', 'wells_within_3mi_at_start', 
+        'distance_to_nearest_at_start', 'distance_to_second_nearest_at_start'
     ]
     
     # Reorder and ensure all features exist
@@ -172,17 +244,25 @@ def build_ranking_features(
 
 def get_feature_names() -> list:
     """
-    Get the list of feature names in the correct order
+    Get the list of feature names in the correct order (17 features)
     
     Returns:
         List of feature names
     """
     return [
-        'distance_mi', 'distance_km', 'log_distance',
-        'length_ratio', 'length_delta', 'log_length_ratio', 'abs_log_length_ratio',
+        # Distance (2)
+        'distance_mi', 'log_distance',
+        # Lateral Length (3)
+        'length_delta', 'log_length_ratio', 'abs_log_length_ratio',
+        # Completion Design (2)
         'ppf_ratio', 'log_ppf_ratio',
-        'same_formation', 'same_operator',
-        'vintage_gap_years', 'abs_vintage_gap',
-        'embedding_pc1', 'embedding_pc2', 'embedding_pc3', 'embedding_pc4',
-        'distance_x_formation', 'distance_x_operator', 'length_x_ppf'
+        # Operator (1)
+        'same_operator',
+        # Temporal (1)
+        'vintage_gap_years',
+        # Peak Production (4)
+        'candidate_peak_oil', 'peak_oil_ratio', 'log_peak_oil_ratio', 'decline_rate_diff',
+        # Time-Aware Well Spacing (4)
+        'wells_within_1mi_at_start', 'wells_within_3mi_at_start', 
+        'distance_to_nearest_at_start', 'distance_to_second_nearest_at_start'
     ]

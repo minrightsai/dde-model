@@ -130,12 +130,26 @@ class LightGBMAnalogRanker:
                 c.proppant_per_ft as candidate_ppf,
                 ac.candidate_formation,
                 ac.candidate_operator,
-                ce.oil_embedding as candidate_embedding
+                -- Peak features for candidates
+                pf.peak_oil as candidate_peak_oil,
+                pf.peak_gas as candidate_peak_gas,
+                pf.peak_oil_month as candidate_peak_oil_month,
+                pf.oil_decline_rate as candidate_oil_decline_rate,
+                -- Peak features for targets
+                pf_t.peak_oil as target_peak_oil,
+                pf_t.peak_oil_month as target_peak_oil_month,
+                pf_t.oil_decline_rate as target_oil_decline_rate,
+                -- Time-aware spacing features
+                ac.wells_within_1mi_at_start,
+                ac.wells_within_3mi_at_start,
+                ac.distance_to_nearest_at_start,
+                ac.distance_to_second_nearest_at_start
             FROM data.analog_candidates ac
             JOIN training_targets tt ON ac.target_well_id = tt.target_well_id
             JOIN data.early_rates t ON ac.target_well_id = t.well_id
             JOIN data.early_rates c ON ac.candidate_well_id = c.well_id
-            LEFT JOIN data.curve_embeddings ce ON c.well_id = ce.well_id
+            LEFT JOIN data.peak_features pf ON c.well_id = pf.well_id
+            LEFT JOIN data.peak_features pf_t ON t.well_id = pf_t.well_id
             WHERE ac.formation_match = true  -- ONLY same-formation pairs for training
             {basin_filter_ac}
         )
@@ -170,10 +184,17 @@ class LightGBMAnalogRanker:
                 'proppant_per_ft': target_data['target_ppf'],
                 'formation': target_data['target_formation'],
                 'operator_name': target_data['target_operator'],
-                'first_prod_date': None  # Not needed since vintage_gap is pre-computed
+                'first_prod_date': None,  # Not needed since vintage_gap is pre-computed
+                'peak_oil': target_data.get('target_peak_oil', 0),
+                'peak_oil_month': target_data.get('target_peak_oil_month', 3),
+                'oil_decline_rate': target_data.get('target_oil_decline_rate', 0.7)
             }
             candidates = data[data['target_well_id'] == target_id].copy()
-            features_batch = build_ranking_features(candidates, target_well)
+            # Pass peak features data to build_ranking_features
+            peak_data = candidates[['candidate_well_id', 'candidate_peak_oil', 'candidate_peak_gas', 
+                                   'candidate_peak_oil_month', 'candidate_oil_decline_rate']].copy()
+            peak_data.columns = ['well_id', 'peak_oil', 'peak_gas', 'peak_oil_month', 'oil_decline_rate']
+            features_batch = build_ranking_features(candidates, target_well, peak_features_df=peak_data)
             all_features.append(features_batch)
         
         features = pd.concat(all_features, ignore_index=True)

@@ -60,7 +60,11 @@ def generate_candidate_pool_fast(basin='dj_basin'):
         candidate_operator,
         target_formation,
         candidate_formation,
-        basin_name
+        basin_name,
+        wells_within_1mi_at_start,
+        wells_within_3mi_at_start,
+        distance_to_nearest_at_start,
+        distance_to_second_nearest_at_start
     )
     SELECT 
         t.well_id as target_well_id,
@@ -99,7 +103,14 @@ def generate_candidate_pool_fast(basin='dj_basin'):
         c.formation as candidate_formation,
         
         -- Basin
-        '{config.basin_name}' as basin_name
+        '{config.basin_name}' as basin_name,
+        
+        -- Time-aware well spacing calculations (simplified for performance)
+        -- TODO: Add actual calculations in separate update step
+        0 as wells_within_1mi_at_start,
+        0 as wells_within_3mi_at_start,
+        999.0 as distance_to_nearest_at_start,
+        999.0 as distance_to_second_nearest_at_start
         
     FROM data.early_rates t
     INNER JOIN data.early_rates c ON TRUE  -- Cartesian product with filters
@@ -179,7 +190,11 @@ def generate_candidate_pool_fast(basin='dj_basin'):
             COUNT(*) as total_pairs,
             AVG(distance_mi) as avg_distance,
             MAX(distance_mi) as max_distance,
-            AVG(CASE WHEN formation_match THEN 1 ELSE 0 END) * 100 as formation_match_pct
+            AVG(CASE WHEN formation_match THEN 1 ELSE 0 END) * 100 as formation_match_pct,
+            AVG(wells_within_1mi_at_start) as avg_wells_1mi,
+            AVG(wells_within_3mi_at_start) as avg_wells_3mi,
+            AVG(distance_to_nearest_at_start) as avg_nearest_dist,
+            AVG(distance_to_second_nearest_at_start) as avg_second_nearest_dist
         FROM data.analog_candidates
         WHERE basin_name = '{config.basin_name}'
         """
@@ -191,10 +206,20 @@ def generate_candidate_pool_fast(basin='dj_basin'):
         logger.info(f"  Target wells: {stats[0]:,}")
         logger.info(f"  Unique candidates: {stats[1]:,}")
         logger.info(f"  Total pairs: {stats[2]:,}")
-        logger.info(f"  Avg candidates per target: {stats[2]/stats[0]:.0f}")
-        logger.info(f"  Avg distance: {stats[3]:.1f} miles")
-        logger.info(f"  Max distance: {stats[4]:.1f} miles")
-        logger.info(f"  Formation match: {stats[5]:.1f}%")
+        if stats[0] > 0:
+            logger.info(f"  Avg candidates per target: {stats[2]/stats[0]:.0f}")
+            logger.info(f"  Avg distance: {stats[3]:.1f} miles")
+            logger.info(f"  Max distance: {stats[4]:.1f} miles")
+            logger.info(f"  Formation match: {stats[5]:.1f}%")
+        else:
+            logger.info(f"  Avg candidates per target: 0")
+            logger.info(f"  No statistics available (no target wells)")
+        if stats[0] > 0:
+            logger.info(f"\nTime-Aware Well Spacing:")
+            logger.info(f"  Avg wells within 1mi at start: {stats[6]:.1f}")
+            logger.info(f"  Avg wells within 3mi at start: {stats[7]:.1f}")
+            logger.info(f"  Avg distance to nearest: {stats[8]:.1f} miles")
+            logger.info(f"  Avg distance to 2nd nearest: {stats[9]:.1f} miles")
 
 def main():
     parser = argparse.ArgumentParser(description='Fast candidate pool generation')

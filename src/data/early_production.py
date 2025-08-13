@@ -31,7 +31,8 @@ class EarlyProductionBuilder:
         """
         self.db = db_connector or DatabaseConnector()
         self.basin_config = BasinConfig(basin)
-        self.basin_name = basin
+        # Map basin parameter to basin_name in database
+        self.basin_name = 'dj_basin' if basin == 'dj' else basin
         
         # Use config for table names
         self.wells_table = self.basin_config.get_table_name('wells')
@@ -106,10 +107,12 @@ class EarlyProductionBuilder:
             SELECT 
                 p.{self.db.column_mapping['WELL_ID']} as well_id,
                 MIN(p.{self.db.column_mapping['PROD_DATE']}) as actual_first_prod_date,
-                COUNT(DISTINCT p.prod_month) as months_available
+                COUNT(DISTINCT p.prod_month) as months_available,
+                SUM(CASE WHEN p.{self.db.column_mapping['OIL_MO_PROD']} = 0 OR p.{self.db.column_mapping['OIL_MO_PROD']} IS NULL THEN 1 ELSE 0 END) as zero_months
             FROM {self.prod_table} p
             GROUP BY p.{self.db.column_mapping['WELL_ID']}
             HAVING COUNT(DISTINCT p.prod_month) >= {self.months_to_analyze}  -- Only wells with required months
+            AND SUM(CASE WHEN p.{self.db.column_mapping['OIL_MO_PROD']} = 0 OR p.{self.db.column_mapping['OIL_MO_PROD']} IS NULL THEN 1 ELSE 0 END) <= 2
         )
         SELECT 
             w.{self.db.column_mapping['WELL_ID']} as well_id,
@@ -126,7 +129,7 @@ class EarlyProductionBuilder:
         INNER JOIN wells_with_production wp ON w.{self.db.column_mapping['WELL_ID']} = wp.well_id
         WHERE w.basin_name = '{self.basin_name}'
         AND w.{self.db.column_mapping['LATERAL_LENGTH']} > 0
-        AND w.first_prod_date >= '{self.basin_config.get('min_vintage_year')}-01-01'
+        AND wp.actual_first_prod_date >= '{self.basin_config.get('min_vintage_year')}-01-01'
         ORDER BY wp.actual_first_prod_date DESC, w.{self.db.column_mapping['WELL_ID']}
         """
         
@@ -317,9 +320,12 @@ class EarlyProductionBuilder:
         logger.info(f"  Total wells: {stats['total_wells']:,}")
         logger.info(f"  Unique operators: {stats['unique_operators']}")
         logger.info(f"  Unique formations: {stats['unique_formations']}")
-        logger.info(f"  Avg lateral length: {stats['avg_lateral_length']:.0f} ft")
-        logger.info(f"  Avg cumulative oil (m1-9): {stats['avg_cum_oil']:.0f} bbl")
-        logger.info(f"  Avg cumulative gas (m1-9): {stats['avg_cum_gas']:.0f} mcf")
+        if stats['avg_lateral_length'] is not None:
+            logger.info(f"  Avg lateral length: {stats['avg_lateral_length']:.0f} ft")
+        if stats['avg_cum_oil'] is not None:
+            logger.info(f"  Avg cumulative oil (m1-9): {stats['avg_cum_oil']:.0f} bbl")
+        if stats['avg_cum_gas'] is not None:
+            logger.info(f"  Avg cumulative gas (m1-9): {stats['avg_cum_gas']:.0f} mcf")
         logger.info(f"  Date range: {stats['earliest_prod']} to {stats['latest_prod']}")
         
         return stats
